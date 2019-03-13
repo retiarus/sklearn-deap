@@ -5,6 +5,7 @@ import warnings
 
 import numpy as np
 import random
+import redis
 from deap import base, creator, tools, algorithms
 from collections import defaultdict
 from sklearn.base import clone, is_classifier
@@ -12,6 +13,11 @@ from sklearn.model_selection._validation import _fit_and_score
 from sklearn.model_selection._search import BaseSearchCV, check_cv, _check_param_grid
 from sklearn.metrics.scorer import check_scoring
 from sklearn.utils.validation import _num_samples, indexable
+
+from functools import partial
+
+np_array_gen = partial(np.fromiter, dtype=int)
+
 
 def enum(**enums):
     return type('Enum', (), enums)
@@ -78,7 +84,8 @@ def _individual_to_params(individual, name_values):
 
 
 def _evalFunction(individual, name_values, X, y, scorer, cv, iid, fit_params,
-                  verbose=0, error_score='raise', score_cache={}):
+                  namespace=None,
+                  db_dict=None, verbose=0, error_score='raise', score_cache={}):
     """ Developer Note:
         --------------------
         score_cache was purposefully moved to parameters, and given a dict reference.
@@ -89,13 +96,26 @@ def _evalFunction(individual, name_values, X, y, scorer, cv, iid, fit_params,
         So unless it is replaced this function will be memoized each call automatically. """
 
     parameters = _individual_to_params(individual, name_values)
-    score = 0
     n_test = 0
 
     paramkey = str(individual)
+    if db_dict is not None and namespace is not None:
+        try:
+            client = redis.Redis(**db_dict)
+        except ConnectionResetError as e:
+            print(e)
+
+    score = None
     if paramkey in score_cache:
         score = score_cache[paramkey]
-    else:
+    elif db_dict is not None and namespace is not None:
+        try:
+            score = client.hget(namespace + ':' + paramkey, "score")
+        except ConnectionResetError as e:
+            print(e)
+
+    if score is None:
+        score = 0
         for train, test in cv.split(X, y):
             assert len(train) > 0 and len(test) > 0, "Training and/or testing not long enough for evaluation."
             _score = _fit_and_score(estimator=individual.est, X=X, y=y, scorer=scorer,
@@ -113,6 +133,63 @@ def _evalFunction(individual, name_values, X, y, scorer, cv, iid, fit_params,
         assert n_test > 0, "No fitting was accomplished, check data and cross validation method."
         score /= float(n_test)
         score_cache[paramkey] = score
+        if db_dict is not None and namespace is not None:
+            client.hset(namespace + ':' + paramkey, "score", score)
+
+    return (score,)
+
+def evalFunction(individual, estimator, name_values, X, y, scorer, cv, iid, fit_params, namespace,
+                  db_dict=None, verbose=0, error_score='raise', score_cache={}):
+    """ Developer Note:
+        --------------------
+        score_cache was purposefully moved to parameters, and given a dict reference.
+        It will be modified in-place by _evalFunction based on it's reference.
+        This is to allow for a managed, paralell memoization dict,
+        and also for different memoization per instance of EvolutionaryAlgorithmSearchCV.
+        Remember that dicts created inside function definitions are presistent between calls,
+        So unless it is replaced this function will be memoized each call automatically. """
+
+    parameters = _individual_to_params(individual, name_values)
+    n_test = 0
+
+    paramkey = str(individual)
+    if db_dict is not None and namespace is not None:
+        try:
+            client = redis.Redis(**db_dict)
+        except ConnectionResetError as e:
+            print(e)
+
+    score = None
+    if paramkey in score_cache:
+        score = score_cache[paramkey]
+    elif db_dict is not None and namespace is not None:
+        try:
+            score = client.hget(namespace + ':' + paramkey, "score")
+        except ConnectionResetError as e:
+            print(e)
+
+    if score is None:
+        score = 0
+        for train, test in cv.split(X, y):
+            assert len(train) > 0 and len(test) > 0, "Training and/or testing not long enough for evaluation."
+            _score = _fit_and_score(estimator=estimator,
+                                    X=X, y=y, scorer=scorer,
+                                    train=train, test=test, verbose=verbose,
+                                    parameters=parameters, fit_params=fit_params,
+                                    error_score=error_score)[0]
+
+            if iid:
+                score += _score * len(test)
+                n_test += len(test)
+            else:
+                score += _score
+                n_test += 1
+
+        assert n_test > 0, "No fitting was accomplished, check data and cross validation method."
+        score /= float(n_test)
+        score_cache[paramkey] = score
+        if db_dict is not None and namespace is not None:
+            client.hset(namespace + ':' + paramkey, "score", score)
 
     return (score,)
 
@@ -285,7 +362,7 @@ class EvolutionaryAlgorithmSearchCV(BaseSearchCV):
         """
         pass
 
-    def __init__(self, estimator, params, scoring=None, cv=4,
+    def __init__(self, estimator, params, map_function=None, namespace=None, db_dict=None, scoring=None, cv=4,
                  refit=True, verbose=False, population_size=50,
                  gene_mutation_prob=0.1, gene_crossover_prob=0.5,
                  tournament_size=3, generations_number=10, gene_type=None,
@@ -309,6 +386,9 @@ class EvolutionaryAlgorithmSearchCV(BaseSearchCV):
         self.best_params_ = None
         self.score_cache = {}
         self.n_jobs = n_jobs
+        self.namespace = None
+        self.db_dict = db_dict
+        self.map_function = map_function
         creator.create("FitnessMax", base.Fitness, weights=(1.0,))
         creator.create("Individual", list, est=clone(self.estimator), fitness=creator.FitnessMax)
 
@@ -422,7 +502,9 @@ class EvolutionaryAlgorithmSearchCV(BaseSearchCV):
                          name_values=name_values, X=X, y=y,
                          scorer=self.scorer_, cv=cv, iid=self.iid, verbose=self.verbose,
                          error_score=self.error_score, fit_params=self.fit_params,
-                         score_cache=self.score_cache)
+                         score_cache=self.score_cache,
+                         db_dict=self.db_dict,
+                         namespace=self.namespace)
 
         toolbox.register("mate", _cxIndividual, indpb=self.gene_crossover_prob, gene_type=self.gene_type)
 
